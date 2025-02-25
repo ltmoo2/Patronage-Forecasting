@@ -1,0 +1,538 @@
+---
+title: "Patronage Forecasting"
+author: "Lachlan Moody 27809951"
+date: "2025-02-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(fpp3)
+library(readxl)
+library(janitor)
+library(lubridate)
+library(scales)
+```
+
+## Data
+
+```{r}
+
+## Historic Population
+
+erp_victoria <- read_xlsx("Data/ERP - Victoria.xlsx", skip = 2) %>%
+  filter(is.na(Number) == F) %>%
+  clean_names()  %>%
+  mutate(date = dmy(paste("01-07", year_ending_june_30, sep = "-"))) %>%
+  select(date,
+         erp_victoria = number)
+
+
+erp_melb <- read_xlsx("Data/ERP - Greater Melbourne.xlsx", skip = 2) %>%
+  filter(is.na(Number) == F) %>%
+  clean_names()  %>%
+  mutate(date = dmy(paste("01-07", year_ending_june_30, sep = "-"))) %>%
+  select(date,
+         erp_greater_melbourne = number)
+
+```
+
+```{r}
+
+## Forecasted Population
+
+abs_victoria <- read_xlsx("Data/Projected population, components of change and summary statistics, 2022 (base) to 2071.xlsx", sheet = "Vic.", skip = 48, n_max = 1) %>%
+  select(-`Total growth`:-`145339`) %>%
+  pivot_longer(everything(), names_to = "discard", values_to = "erp_victoria") %>%
+  mutate(year = seq(from = 2024, to = 2071)) %>%
+  mutate(date = dmy(paste("01-07", year, sep = "-"))) %>%
+  select(date,
+         erp_victoria) %>%
+  filter(date <= "2029-07-01")
+  
+abs_melb <- read_xlsx("Data/Projected population, components of change and summary statistics, 2022 (base) to 2071.xlsx", sheet = "Greater Melbourne", skip = 48, n_max = 1) %>%
+  select(-`Total growth`:-`129347`) %>%
+  pivot_longer(everything(), names_to = "discard", values_to = "erp_greater_melbourne") %>%
+  mutate(year = seq(from = 2024, to = 2071)) %>%
+  mutate(date = dmy(paste("01-07", year, sep = "-"))) %>%
+  select(date,
+         erp_greater_melbourne) %>%
+  filter(date <= "2029-07-01")
+
+```
+
+```{r}
+
+# Combined Population
+
+population_combined <- bind_rows(erp_victoria, abs_victoria) %>%
+  left_join(
+    bind_rows(erp_melb,
+              abs_melb),
+    by = "date"
+  )
+```
+
+```{r}
+
+# Historic Jobs
+
+historic_jobs <- read_csv("Data/employment-by-block-by-clue-industry.csv") %>%
+  clean_names() %>%
+  filter(clue_small_area %in% c("Melbourne (CBD)", "City of Melbourne (total)")) %>%
+  group_by(census_year, clue_small_area) %>%
+  summarise(jobs = sum(total_jobs_in_block, na.rm = TRUE)) %>%
+  pivot_wider(names_from = clue_small_area, values_from = jobs) %>%
+  clean_names()  %>%
+  ungroup() %>%
+  mutate(date = dmy(paste("01-07", census_year, sep = "-"))) %>%
+  select(date,
+         city_of_melbourne_jobs = city_of_melbourne_total,
+         melbourne_cbd_jobs = melbourne_cbd) %>%
+  filter(date != "2023-07-01") 
+
+```
+
+```{r}
+
+# Forecasted Jobs
+
+forecasted_jobs <- read_csv("Data/city-of-melbourne-jobs-forecasts-by-small-area-2020-2040.csv") %>%
+  clean_names() %>%
+  filter(geography %in% c("Melbourne (CBD)", "City of Melbourne"),
+         industry_space_use == "Total Jobs",
+         category == "Jobs by industry") %>%
+  select(geography, year, value) %>%
+  pivot_wider(names_from = geography, values_from = value) %>%
+  clean_names() %>%
+  mutate(date = dmy(paste("01-07", year, sep = "-"))) %>%
+  select(date,
+         city_of_melbourne_jobs = city_of_melbourne,
+         melbourne_cbd_jobs = melbourne_cbd) %>%
+  filter(date <= "2029-07-01")
+  
+
+```
+
+```{r}
+
+# Combined Jobs
+
+jobs_combined <- bind_rows(historic_jobs, forecasted_jobs)
+
+```
+
+```{r}
+touch_ons_monthly <- read_csv("Data/monthly_touch_ons.csv") %>%
+  mutate(date = ym(`Calendar Mth`)) %>%
+  select(date, touch_ons = `Myki TouchOn`)
+```
+
+```{r}
+
+## WHF Data
+
+wfh_pre_cov <- 5
+wfh_cov <- 0
+wfh_2022 <- 2 
+wfh_2023 <- 2.5
+wfh_2024 <- 3
+wfh_growth_rate_slow <- 0.025
+wfh_growth_rate_med <- 0.05
+wfh_growth_rate_fast <- 0.10
+
+wfh_data <- tibble(date = seq.Date(from = as_date("2014-07-01"), to = as_date("2029-07-01"), by = "1 year")) %>%
+  mutate(wfh_base_rate = case_when(date <= "2019-07-01" ~ wfh_pre_cov,
+                                   date <= "2021-07-01" ~ wfh_cov,
+                                   date == "2022-07-01" ~ wfh_2022,
+                                   date == "2023-07-01" ~ wfh_2023,
+                                   TRUE ~ wfh_2024),
+         slow_growth_rate = if_else(date <= "2024-07-01",
+                                    1,
+                                    1 + wfh_growth_rate_slow),
+         wfh_slow_growth = wfh_base_rate * cumprod(slow_growth_rate),
+         medium_growth_rate = if_else(date <= "2024-07-01",
+                                    1,
+                                    1 + wfh_growth_rate_med),
+         wfh_medium_growth = wfh_base_rate * cumprod(medium_growth_rate),
+         high_growth_rate = if_else(date <= "2024-07-01",
+                                    1,
+                                    1 + wfh_growth_rate_fast),
+         wfh_high_growth = wfh_base_rate * cumprod(high_growth_rate)) %>%
+  select(date, wfh_slow_growth, wfh_medium_growth, wfh_high_growth)
+```
+
+## Forecast Prep
+
+```{r}
+
+## Lets start with annual for now, can interpolate months later if required
+
+touch_ons_for_forecast <- touch_ons_monthly %>%
+  mutate(year = year(date)) %>%
+  group_by(year) %>%
+  summarise(touch_ons = sum(touch_ons)) %>%
+  filter(year != 2025) %>%
+  ungroup() %>%
+  mutate(date = dmy(paste("01-07", year, sep = "-"))) %>%
+  select(date, touch_ons)
+
+
+forecast_data <- touch_ons_for_forecast %>%
+  left_join(population_combined) %>%
+  left_join(jobs_combined) %>%
+  left_join(wfh_data)
+```
+
+```{r}
+forecast_data %>%
+  filter(date <= "2019-07-01") %>%
+  select(-date) %>%
+  cor()
+
+
+forecast_data %>%
+  filter(date >= "2022-07-01") %>%
+  select(-date) %>%
+  cor()
+
+
+forecast_data %>%
+  filter(date >= "2019-07-01") %>%
+  select(-date) %>%
+  cor()
+```
+
+## Forecast Modelling
+
+```{r}
+
+forecast_ts <- forecast_data %>%
+  mutate(year = year(date)) %>%
+  as_tsibble(index = year)
+
+## Lets try standard arima, vic pop, greater melb pop, com jobs, cbd jobs, wfh
+
+
+models <- forecast_ts %>%
+  model(
+    stepwise = ARIMA(touch_ons),
+    search = ARIMA(touch_ons, stepwise = FALSE, approximation = FALSE),
+    everything = TSLM(touch_ons ~ erp_victoria + erp_greater_melbourne + city_of_melbourne_jobs + melbourne_cbd_jobs + wfh_slow_growth),
+    vic_com = TSLM(touch_ons ~ erp_victoria + city_of_melbourne_jobs + wfh_slow_growth),
+    melb_cbd = TSLM(touch_ons ~ erp_greater_melbourne + melbourne_cbd_jobs + wfh_slow_growth),
+    vic_pop = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth),
+    melb_pop = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth),
+    com_job = TSLM(touch_ons ~ city_of_melbourne_jobs + wfh_slow_growth),
+    cbd_job = TSLM(touch_ons ~ melbourne_cbd_jobs + wfh_slow_growth)
+  )
+
+
+models %>%
+  report() %>%
+  arrange(AICc)
+
+## Melb and vic pop seem to be the best models - lets double check by looking at just data up until 2019
+
+```
+
+```{r}
+models <- forecast_ts %>%
+  filter(year <= 2019) %>%
+  model(
+    stepwise = ARIMA(touch_ons),
+    search = ARIMA(touch_ons, stepwise = FALSE, approximation = FALSE),
+    everything = TSLM(touch_ons ~ erp_victoria + erp_greater_melbourne + city_of_melbourne_jobs + melbourne_cbd_jobs + wfh_slow_growth),
+    vic_com = TSLM(touch_ons ~ erp_victoria + city_of_melbourne_jobs + wfh_slow_growth),
+    melb_cbd = TSLM(touch_ons ~ erp_greater_melbourne + melbourne_cbd_jobs + wfh_slow_growth),
+    vic_pop = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth),
+    melb_pop = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth),
+    com_job = TSLM(touch_ons ~ city_of_melbourne_jobs + wfh_slow_growth),
+    cbd_job = TSLM(touch_ons ~ melbourne_cbd_jobs + wfh_slow_growth)
+  )
+
+
+models %>%
+  report() %>%
+  arrange(AICc)
+
+## Bit odd that the model with everything did the best here but melb and vic pop are still best of the rest, lets try one more with trend and seaonal components
+```
+
+```{r}
+models <- forecast_ts %>%
+  model(
+    vic_pop = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth),
+    melb_pop = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth),
+    vic_pop_w_trend = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth + trend()),
+    melb_pop_w_trend = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + trend()),
+    vic_pop_w_season = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth + season()),
+    melb_pop_w_season = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + season()),
+    vic_pop_w_both = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth+ trend() + season()),
+    melb_pop_w_both = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + trend() + season())
+
+  )
+
+
+models %>%
+  report() %>%
+  arrange(AICc)
+
+## No real change - existing predictors likely already covering trend changes but can still include to compare results
+```
+
+```{r}
+
+# Model creation
+
+candidate_models <- forecast_ts %>%
+  model(
+    vic_pop = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth),
+    melb_pop = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth),
+    vic_pop_w_trend = TSLM(touch_ons ~ erp_victoria + wfh_slow_growth + trend()),
+    melb_pop_w_trend = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + trend())
+    )
+
+
+
+future_scenarios <- scenarios(
+  
+  wfh_no_growth = new_data(forecast_ts, 5) %>%
+    mutate(erp_victoria = filter(population_combined, year(date) >= 2025)$erp_victoria,
+    erp_greater_melbourne = filter(population_combined, year(date) >= 2025)$erp_greater_melbourne,
+    wfh_slow_growth = 3),
+  
+  wfh_slow_growth = new_data(forecast_ts, 5) %>%
+    mutate(erp_victoria = filter(population_combined, year(date) >= 2025)$erp_victoria,
+    erp_greater_melbourne = filter(population_combined, year(date) >= 2025)$erp_greater_melbourne,
+    wfh_slow_growth = filter(wfh_data, year(date) >= 2025)$wfh_slow_growth),
+  
+  wfh_medium_growth = new_data(forecast_ts, 5) %>%
+    mutate(erp_victoria = filter(population_combined, year(date) >= 2025)$erp_victoria,
+    erp_greater_melbourne = filter(population_combined, year(date) >= 2025)$erp_greater_melbourne,
+    wfh_slow_growth = filter(wfh_data, year(date) >= 2025)$wfh_medium_growth),
+  
+  wfh_high_growth = new_data(forecast_ts, 5) %>%
+    mutate(erp_victoria = filter(population_combined, year(date) >= 2025)$erp_victoria,
+    erp_greater_melbourne = filter(population_combined, year(date) >= 2025)$erp_greater_melbourne,
+    wfh_slow_growth = filter(wfh_data, year(date) >= 2025)$wfh_high_growth),
+  
+  names_to = "Scenario"
+  
+)
+
+
+scenario_forecast <- forecast(candidate_models,
+                              new_data = future_scenarios)
+
+
+forecast_ts %>%
+  autoplot(touch_ons) +
+  autolayer(scenario_forecast) +
+  facet_wrap(~.model)
+
+```
+
+```{r}
+
+histoic_data <- touch_ons_for_forecast %>%
+  mutate(year = year(date)) %>%
+  select(year, touch_ons)
+
+histoic_data_for_plot <- histoic_data %>%
+  bind_rows(replicate(3, histoic_data, simplify = FALSE)) %>%
+  mutate(Scenario = c(rep("wfh_no_growth", 11),
+                      rep("wfh_slow_growth", 11),
+                      rep("wfh_medium_growth", 11),
+                      rep("wfh_high_growth", 11)))
+
+melb_pop_w_trend_forecasts <- scenario_forecast %>%
+  filter(.model == "melb_pop_w_trend") %>%
+  as_tibble() %>%
+  select(Scenario, year, touch_ons = .mean)
+
+
+plot_data <- histoic_data_for_plot %>%
+  bind_rows(melb_pop_w_trend_forecasts) %>%
+  mutate(scenario = case_when(
+    Scenario == "wfh_no_growth" ~ "WFO - No Growth (3 days per week)",
+    Scenario == "wfh_slow_growth" ~ paste("WFO - Slow Growth (3 days per week +", percent(wfh_growth_rate_slow, accuracy = .1), "per year)"),
+    Scenario == "wfh_medium_growth" ~ paste("WFO - Medium Growth (3 days per week +", percent(wfh_growth_rate_med, accuracy = .1), "per year)"),
+    Scenario == "wfh_high_growth" ~ paste("WFO - High Growth (3 days per week +", percent(wfh_growth_rate_fast, accuracy = .1), "per year)"),
+  )) %>%
+  mutate(scenario = factor(scenario,
+                           levels = c(
+                             "WFO - No Growth (3 days per week)",
+                             paste("WFO - Slow Growth (3 days per week +", percent(wfh_growth_rate_slow, accuracy = .1), "per year)"),
+                             paste("WFO - Medium Growth (3 days per week +", percent(wfh_growth_rate_med, accuracy = .1), "per year)"),
+                             paste("WFO - High Growth (3 days per week +", percent(wfh_growth_rate_fast, accuracy = .1), "per year)")
+                             )
+                           )
+         ) %>%
+  mutate(period = if_else(year <= 2024, "Historic", "Forecast")) %>%
+  filter(year != 2029)
+
+
+
+
+plot <- plot_data %>%
+  ggplot(aes(x = year, y = touch_ons, fill = period)) + 
+  geom_col() +
+  geom_text(aes(label = comma(touch_ons, suffix = "M", scale = 0.000001, accuracy = .1)), vjust = 1.5, colour = "white", fontface = "bold") +
+  facet_wrap(~scenario, scales = "free_x") +
+  scale_fill_manual(values = c("Historic" = "#227BB4",
+                               "Forecast" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_rect(fill = NA)) +
+  labs(x = "", y = "", title = "Patronage Forecasts") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+
+
+plot
+```
+
+```{r}
+plot_s1 <- plot_data %>%
+  filter(Scenario == "wfh_no_growth") %>%
+  ggplot(aes(x = year, y = touch_ons, fill = period)) + 
+  geom_col() +
+  geom_text(aes(label = comma(touch_ons, suffix = "M", scale = 0.000001, accuracy = .1)), vjust = 1.5, colour = "white", fontface = "bold") +
+  facet_wrap(~scenario) +
+  scale_fill_manual(values = c("Historic" = "#227BB4",
+                               "Forecast" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_rect(fill = NA)) +
+  labs(x = "", y = "", title = "Patronage Forecasts") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+
+plot_s1
+```
+
+```{r}
+plot_s2 <- plot_data %>%
+  filter(Scenario == "wfh_slow_growth") %>%
+  ggplot(aes(x = year, y = touch_ons, fill = period)) + 
+  geom_col() +
+  geom_text(aes(label = comma(touch_ons, suffix = "M", scale = 0.000001, accuracy = .1)), vjust = 1.5, colour = "white", fontface = "bold") +
+  facet_wrap(~scenario) +
+  scale_fill_manual(values = c("Historic" = "#227BB4",
+                               "Forecast" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_rect(fill = NA)) +
+  labs(x = "", y = "", title = "Patronage Forecasts") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+
+plot_s2
+```
+
+```{r}
+plot_s3 <- plot_data %>%
+  filter(Scenario == "wfh_medium_growth") %>%
+  ggplot(aes(x = year, y = touch_ons, fill = period)) + 
+  geom_col() +
+  geom_text(aes(label = comma(touch_ons, suffix = "M", scale = 0.000001, accuracy = .1)), vjust = 1.5, colour = "white", fontface = "bold") +
+  facet_wrap(~scenario) +
+  scale_fill_manual(values = c("Historic" = "#227BB4",
+                               "Forecast" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_rect(fill = NA)) +
+  labs(x = "", y = "", title = "Patronage Forecasts") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+
+plot_s3
+```
+
+```{r}
+plot_s4 <- plot_data %>%
+  filter(Scenario == "wfh_high_growth") %>%
+  ggplot(aes(x = year, y = touch_ons, fill = period)) + 
+  geom_col() +
+  geom_text(aes(label = comma(touch_ons, suffix = "M", scale = 0.000001, accuracy = .1)), vjust = 1.5, colour = "white", fontface = "bold") +
+  facet_wrap(~scenario) +
+  scale_fill_manual(values = c("Historic" = "#227BB4",
+                               "Forecast" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.border = element_rect(fill = NA)) +
+  labs(x = "", y = "", title = "Patronage Forecasts") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+
+plot_s4
+```
+
+
+
+```{r}
+plot_data %>%
+  filter(year >= 2024) %>%
+  select(year, scenario, touch_ons) %>%
+  group_by(scenario) %>%
+  mutate(touch_ons_2024 = first(touch_ons),
+         growth_from_2024 = (touch_ons - touch_ons_2024) / touch_ons,
+         annual_growth = (touch_ons - lag(touch_ons)) / touch_ons) %>%
+  ungroup() %>%
+  select(-touch_ons_2024) %>%
+  write_csv("forecast_outcomes.csv")
+```
+
+
+```{r}
+options(scipen = 999)
+
+model_selected <- candidate_models %>%
+  select(melb_pop_w_trend)
+
+report(model_selected)
+
+# For every 1 person increase in the ERP of Greater Melbourne, touch_ons increase by 95.67
+# A one day increase in wfh increases touch-ons by ~27.5 million per year
+# Independent of the above, weak trend showing touch-ons declining by ~5.25 mliion per year
+```
+```{r}
+augment(model_selected) %>%
+  select(year, touch_ons, .fitted) %>%
+  pivot_longer(touch_ons:.fitted) %>%
+  mutate(name = if_else(name == "touch_ons", "Actual", "Fitted")) %>%
+  ggplot(aes(x = year, y = value, fill = name)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Actual" = "#227BB4",
+                               "Fitted" = "#F07B05")) +
+  theme_minimal() +
+  theme(legend.position = "top",
+        panel.border = element_rect(fill = NA),
+        legend.justification = "left") +
+  labs(x = "", y = "", title = "Model Fit", fill = "") +
+  scale_y_continuous(labels = comma_format(suffix = "M", scale = 0.000001)) 
+```
+
+
+
+```{r}
+
+# Last try with arima erros
+
+models_final <- forecast_ts %>%
+  model(
+    melb_pop_w_trend = TSLM(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + trend()),
+    melb_pop_w_arima = ARIMA(touch_ons ~ erp_greater_melbourne + wfh_slow_growth),
+    melb_pop_w_arima_and_trend = ARIMA(touch_ons ~ erp_greater_melbourne + wfh_slow_growth + trend()))
+
+
+models_final %>%
+  report() %>%
+  arrange(AICc)
+
+
+# Regular with trend seems the best
+```
+
